@@ -1,0 +1,8 @@
+mysql-connector==2.2.9
+openpyxl==3.1.5
+pycryptodome==3.20.0
+odoo_test_helper==2.1.1
+google_auth
+requests
+urllib3
+phonenumbers
