@@ -6,7 +6,9 @@ from unittest import mock
 
 from lxml import etree
 
-from odoo.exceptions import ValidationError
+from odoo import Command
+from odoo.exceptions import AccessError, ValidationError
+from odoo.fields import Domain
 from odoo.tests import Form
 from odoo.tests.common import tagged
 
@@ -74,7 +76,7 @@ class TierTierValidation(CommonTierValidation):
         self.assertTrue(reviews)
         record = self.test_record.with_user(self.test_user_1.id)
         self.assertIn(self.test_user_1, record.reviewer_ids)
-        res = self.test_model.search([("reviewer_ids", "in", self.test_user_1.id)])
+        res = self.test_model.search(Domain("reviewer_ids", "in", self.test_user_1.id))
         self.assertTrue(res)
 
     def test_10_systray_counter(self):
@@ -137,11 +139,9 @@ class TierTierValidation(CommonTierValidation):
                 "has_comment": True,
             }
         )
-        # Request validation
+        # Request validation -- auto-promotes the single review to pending.
         review = test_record.with_user(self.test_user_2.id).request_validation()
         self.assertTrue(review)
-        # Let _compute_can_review assign status 'pending' instead of waiting
-        review.flush_recordset()
         record = test_record.with_user(self.test_user_1.id)
         res = record.validate_tier()
         ctx = res.get("context")
@@ -194,7 +194,7 @@ class TierTierValidation(CommonTierValidation):
         )._notify_rejected_review_body()
         self.assertEqual(comment, "A review was rejected by John. (Test Comment)")
 
-    def test_12_approve_sequence(self):
+    def test_12_approve_sequence_validate(self):
         # Create new test record
         test_record = self.test_model.create({"test_field": 2.5})
         # Create tier definitions
@@ -238,6 +238,58 @@ class TierTierValidation(CommonTierValidation):
         self.assertFalse(any(r.status == "approved" for r in record1.review_ids))
         record1.validate_tier()
         self.assertTrue(any(r.status == "approved" for r in record1.review_ids))
+
+    def test_12_approve_sequence_reject(self):
+        # Create new test record
+        test_record = self.test_model.create({"test_field": 2.5})
+        # Create tier definitions
+        tier_def_1 = self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+                "approve_sequence": True,
+                "sequence": 30,
+            }
+        )
+        tier_def_2 = self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_2.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+                "approve_sequence": True,
+                "sequence": 20,
+            }
+        )
+        tier_def_3 = self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_3_multi_company.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+                "approve_sequence": True,
+                "sequence": 10,
+            }
+        )
+        # Request validation
+        self.assertFalse(self.test_record.review_ids)
+        reviews = test_record.with_user(self.test_user_2.id).request_validation()
+        self.assertTrue(reviews)
+        record = test_record.with_user(self.test_user_1.id)
+        self.assertTrue(record.can_review)
+        # User 1 validates the record, extra reviews should be cancel.
+        self.assertFalse(any(r.status == "approved" for r in record.review_ids))
+        record.reject_tier()
+        self.assertTrue(any(r.status == "rejected" for r in record.review_ids))
+        self.assertTrue(any(r.status == "cancel" for r in record.review_ids))
+        review_1 = record.review_ids.filtered(lambda x: x.definition_id == tier_def_1)
+        self.assertEqual(review_1.status, "rejected")
+        review_2 = record.review_ids.filtered(lambda x: x.definition_id == tier_def_2)
+        self.assertEqual(review_2.status, "cancel")
+        review_3 = record.review_ids.filtered(lambda x: x.definition_id == tier_def_3)
+        self.assertEqual(review_3.status, "cancel")
 
     def test_12_approve_sequence_same_user(self):
         """Similar to test_12_approve_sequence, but all same users,
@@ -456,22 +508,50 @@ class TierTierValidation(CommonTierValidation):
             self.test_user_2.with_user(self.test_user_2).review_user_count()
         )
 
+    def test_16b_review_user_count_no_model_access(self):
+        """Reviewer without ir.model.access read on the validated model must
+        not crash the systray endpoint. Regression: the systray called
+        Model.with_user(user).search(...) which raises AccessError when the
+        user has no read access (e.g. tier definition on account.move for a
+        non-accounting user)."""
+        test_record = self.test_model.create({"test_field": 2.5})
+        self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_2.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+            }
+        )
+        test_record.with_user(self.test_user_1).request_validation()
+        self.assertTrue(self.test_user_2.review_ids)
+        # Revoke read access on the validated model for non-superadmin users.
+        self.env["ir.model.access"].search(
+            Domain("model_id", "=", self.tester_model.id)
+        ).unlink()
+        # Sanity check: a direct search now raises AccessError.
+        with self.assertRaises(AccessError):
+            self.test_model.with_user(self.test_user_2).search([])
+        # The systray endpoint must swallow that error and return [].
+        result = self.test_user_2.with_user(self.test_user_2).review_user_count()
+        self.assertEqual(result, [])
+
     def test_17_search_records_no_validation(self):
         """Search for records that have no validation process started"""
         records = self.env["tier.validation.tester"].search(
-            [("reviewer_ids", "=", False)]
+            Domain("reviewer_ids", "=", False)
         )
         self.assertEqual(len(records), 1)
         self.test_record.with_user(self.test_user_2.id).request_validation()
         self.test_record.with_user(self.test_user_1.id)
         records = self.env["tier.validation.tester"].search(
-            [("reviewer_ids", "=", False)]
+            Domain("reviewer_ids", "=", False)
         )
         self.assertEqual(len(records), 0)
 
     def test_18_test_review_by_res_users_field(self):
         selected_field = self.env["ir.model.fields"].search(
-            [("model", "=", self.test_model._name), ("name", "=", "user_id")]
+            Domain("model", "=", self.test_model._name) & Domain("name", "=", "user_id")
         )
         test_record = self.test_model.create(
             {"test_field": 2.5, "user_id": self.test_user_2.id}
@@ -496,19 +576,19 @@ class TierTierValidation(CommonTierValidation):
         # Create new test record
         tier_review_obj = self.env["tier.review"]
         test_record = self.test_model.create({"test_field": 3.5})
-        # Request validation
+        # Request validation -- the first review must be promoted to ``pending``
+        # automatically; the second one stays ``waiting`` until its turn.
         review = test_record.request_validation()
 
         self.assertTrue(review)
-        # both reviews should be waiting when created
         review_1 = tier_review_obj.browse(review.ids[0])
         review_2 = tier_review_obj.browse(review.ids[1])
-        self.assertTrue(review_1.status == "waiting")
-        self.assertTrue(review_2.status == "waiting")
-        # and then normal workflow will follow...
         review_1.invalidate_model()
-        review_1._compute_can_review()
         self.assertTrue(review_1.status == "pending")
+        # ``next_review`` must contain the pending review's definition name,
+        # not the str-representation of an empty recordset (e.g. ``tier.review()``).
+        test_record.invalidate_recordset(["next_review"])
+        self.assertEqual(test_record.next_review, f"Next: {review_1.name}")
         # first reviewer does not want notifications
         # chatter should be empty
         self.assertFalse(test_record.message_ids)
@@ -527,17 +607,128 @@ class TierTierValidation(CommonTierValidation):
         self.assertTrue(review_2.done_by.id is False)
         self.assertTrue(review_2.reviewed_date is False)
 
+    def test_19a_notify_on_pending_sequence_negative(self):
+        """When ``approve_sequence`` is used, only the first reviewer in the
+        chain must receive a ``notify_on_pending`` notification. The next
+        reviewer must NOT be subscribed and must NOT receive a message until
+        their predecessor has approved.
+        """
+        # Fresh definitions so the test is self-contained: both have
+        # ``notify_on_pending=True`` so the difference between sequence
+        # positions is what is being asserted. Use a ``test_field`` value
+        # that does NOT match any definition created by ``common.py`` so
+        # only these two definitions apply.
+        TierDefinition = self.env["tier.definition"]
+        test_record = self.test_model.create({"test_field": 2.5})
+        def_first = TierDefinition.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('test_field', '=', 2.5)]",
+                "approve_sequence": True,
+                "notify_on_pending": True,
+                "sequence": 20,
+                "name": "First in sequence -- user 1",
+            }
+        )
+        def_second = TierDefinition.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_2.id,
+                "definition_domain": "[('test_field', '=', 2.5)]",
+                "approve_sequence": True,
+                "notify_on_pending": True,
+                "sequence": 10,
+                "name": "Second in sequence -- user 2",
+            }
+        )
+
+        reviews = test_record.request_validation()
+        # ``request_validation`` iterates definitions in ``sequence desc``, so
+        # def_first (sequence=20) becomes tier.review.sequence=1 and def_second
+        # (sequence=10) becomes tier.review.sequence=2.
+        review_first = reviews.filtered(lambda r: r.definition_id == def_first)
+        review_second = reviews.filtered(lambda r: r.definition_id == def_second)
+        self.assertEqual(review_first.status, "pending")
+        self.assertEqual(review_second.status, "waiting")
+
+        # Exactly one chatter message must have been posted -- for the first
+        # reviewer reaching ``pending``. The second reviewer must not have been
+        # subscribed yet and must not have been notified.
+        self.assertEqual(len(test_record.message_ids), 1)
+        first_message = test_record.message_ids
+        followers = test_record.message_follower_ids
+        self.assertIn(self.test_user_1.partner_id, followers.mapped("partner_id"))
+        self.assertNotIn(
+            self.test_user_2.partner_id,
+            followers.mapped("partner_id"),
+            "Second-tier reviewer must not be subscribed to the record before "
+            "their turn.",
+        )
+        self.assertNotIn(
+            self.test_user_2.partner_id,
+            first_message.notified_partner_ids,
+            "Second-tier reviewer must not be notified before their "
+            "predecessor has approved.",
+        )
+
+        # Once the first reviewer approves, the second review must reach
+        # ``pending`` AND its reviewer must receive their own notification.
+        test_record.with_user(self.test_user_1).validate_tier()
+        self.assertEqual(review_first.status, "approved")
+        self.assertEqual(review_second.status, "pending")
+        followers = test_record.message_follower_ids
+        self.assertIn(self.test_user_2.partner_id, followers.mapped("partner_id"))
+        new_messages = test_record.message_ids - first_message
+        self.assertTrue(new_messages)
+        self.assertIn(
+            self.test_user_2.partner_id,
+            new_messages.mapped("notified_partner_ids"),
+            "Second-tier reviewer must be notified once promoted to pending.",
+        )
+
+    def test_19b_notify_review_available_no_op_when_no_users(self):
+        """``_notify_review_available`` must short-circuit (no follower
+        added, no chatter message posted) when none of the passed reviews
+        actually wants ``notify_on_pending``. This is the defensive contract
+        that prevents stray subtype messages routed to nobody.
+        """
+        TierDefinition = self.env["tier.definition"]
+        test_record = self.test_model.create({"test_field": 2.5})
+        silent_def = TierDefinition.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('test_field', '=', 2.5)]",
+                "notify_on_pending": False,
+                "sequence": 10,
+                "name": "Silent definition -- no notify_on_pending",
+            }
+        )
+        reviews = test_record.request_validation()
+        silent_review = reviews.filtered(lambda r: r.definition_id == silent_def)
+        self.assertTrue(silent_review)
+
+        followers_before = test_record.message_follower_ids
+        messages_before = test_record.message_ids
+        test_record._notify_review_available(silent_review)
+        self.assertEqual(test_record.message_follower_ids, followers_before)
+        self.assertEqual(test_record.message_ids, messages_before)
+
     def test_20_no_sequence(self):
         # Create new test record
         tier_review_obj = self.env["tier.review"]
         test_record2 = self.test_model.create({"test_field": 0.9})
-        # request validation
+        # Request validation -- with no approve_sequence the single review must
+        # be promoted to ``pending`` automatically and ``notify_on_pending``
+        # must trigger a chatter message.
         review = test_record2.request_validation()
         self.assertTrue(review)
         review_1 = tier_review_obj.browse(review.ids[0])
-        self.assertTrue(review_1.status == "waiting")
         review_1.invalidate_model()
-        review_1._compute_can_review()
         self.assertTrue(review_1.status == "pending")
         msg2 = test_record2.message_ids[0].body
         request = test_record2._notify_requested_review_body()
@@ -545,7 +736,7 @@ class TierTierValidation(CommonTierValidation):
 
     def test_21_notify_on_create(self):
         # notify on create
-        tier_definition = self.env["tier.definition"].search([])
+        tier_definition = self.env["tier.definition"].search(Domain.TRUE)
         tier_definition.write(
             {
                 "notify_on_create": True,
@@ -559,13 +750,13 @@ class TierTierValidation(CommonTierValidation):
         test_record_1 = self.test_model.create({"test_field": 1})
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record_1.request_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -575,13 +766,13 @@ class TierTierValidation(CommonTierValidation):
         test_record_2 = self.test_model.create({"test_field": 1})
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record_2.request_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -589,12 +780,12 @@ class TierTierValidation(CommonTierValidation):
     def test_22_notify_on_accepted(self):
         self.test_user_2.write(
             {
-                "groups_id": [(6, 0, self.env.ref("base.group_system").ids)],
+                "group_ids": [Command.set(self.env.ref("base.group_system").ids)],
             }
         )
 
         # notify on accepted
-        tier_definition = self.env["tier.definition"].search([])
+        tier_definition = self.env["tier.definition"].search(Domain.TRUE)
         tier_definition.write(
             {
                 "notify_on_create": False,
@@ -610,13 +801,13 @@ class TierTierValidation(CommonTierValidation):
         record = test_record_1.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.validate_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -628,13 +819,13 @@ class TierTierValidation(CommonTierValidation):
         test_record_2.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record_2.validate_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -642,12 +833,12 @@ class TierTierValidation(CommonTierValidation):
     def test_23_notify_on_rejected(self):
         self.test_user_2.write(
             {
-                "groups_id": [(6, 0, self.env.ref("base.group_system").ids)],
+                "group_ids": [Command.set(self.env.ref("base.group_system").ids)],
             }
         )
 
         # notify on rejected
-        tier_definition = self.env["tier.definition"].search([])
+        tier_definition = self.env["tier.definition"].search(Domain.TRUE)
         tier_definition.write(
             {
                 "notify_on_create": False,
@@ -663,13 +854,13 @@ class TierTierValidation(CommonTierValidation):
         record = test_record_1.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.reject_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -682,13 +873,13 @@ class TierTierValidation(CommonTierValidation):
 
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record_2.reject_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -696,12 +887,12 @@ class TierTierValidation(CommonTierValidation):
     def test_24_notify_on_restarted(self):
         self.test_user_2.write(
             {
-                "groups_id": [(6, 0, self.env.ref("base.group_system").ids)],
+                "group_ids": [Command.set(self.env.ref("base.group_system").ids)],
             }
         )
 
         # notify on restarted
-        tier_definition = self.env["tier.definition"].search([])
+        tier_definition = self.env["tier.definition"].search(Domain.TRUE)
         tier_definition.write(
             {
                 "notify_on_create": False,
@@ -717,13 +908,13 @@ class TierTierValidation(CommonTierValidation):
         record = test_record_1.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.restart_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -735,13 +926,13 @@ class TierTierValidation(CommonTierValidation):
         test_record_2.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record_2.restart_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -749,12 +940,12 @@ class TierTierValidation(CommonTierValidation):
     def test_25_all_notification(self):
         self.test_user_2.write(
             {
-                "groups_id": [(6, 0, self.env.ref("base.group_system").ids)],
+                "group_ids": [Command.set(self.env.ref("base.group_system").ids)],
             }
         )
 
         # notify on restarted
-        tier_definition = self.env["tier.definition"].search([])
+        tier_definition = self.env["tier.definition"].search(Domain.TRUE)
         tier_definition.write(
             {
                 "notify_on_create": True,
@@ -771,13 +962,13 @@ class TierTierValidation(CommonTierValidation):
         # request validation
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record.request_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -786,13 +977,13 @@ class TierTierValidation(CommonTierValidation):
         record = test_record.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.validate_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -800,13 +991,13 @@ class TierTierValidation(CommonTierValidation):
         # restart validation
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.restart_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -815,13 +1006,13 @@ class TierTierValidation(CommonTierValidation):
         record.request_validation()
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.reject_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1 + 1)
@@ -829,12 +1020,12 @@ class TierTierValidation(CommonTierValidation):
     def test_26_no_notification(self):
         self.test_user_2.write(
             {
-                "groups_id": [(6, 0, self.env.ref("base.group_system").ids)],
+                "group_ids": [Command.set(self.env.ref("base.group_system").ids)],
             }
         )
 
         # notify on restarted
-        tier_definition = self.env["tier.definition"].search([])
+        tier_definition = self.env["tier.definition"].search(Domain.TRUE)
         tier_definition.write(
             {
                 "notify_on_create": False,
@@ -851,13 +1042,13 @@ class TierTierValidation(CommonTierValidation):
         # request validation
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         test_record.request_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -866,13 +1057,13 @@ class TierTierValidation(CommonTierValidation):
         record = test_record.with_user(self.test_user_2.id)
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.validate_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -880,13 +1071,13 @@ class TierTierValidation(CommonTierValidation):
         # restart validation
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.restart_validation()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -895,13 +1086,13 @@ class TierTierValidation(CommonTierValidation):
         record.request_validation()
         notifications_no_1 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         record.reject_tier()
         notifications_no_2 = len(
             self.env["mail.notification"].search(
-                [("res_partner_id", "=", self.test_user_1.partner_id.id)]
+                Domain("res_partner_id", "=", self.test_user_1.partner_id.id)
             )
         )
         self.assertEqual(notifications_no_2, notifications_no_1)
@@ -947,6 +1138,7 @@ class TierTierValidation(CommonTierValidation):
         # Able to write test_validation_field after validation
         with mock.patch.multiple(
             TV,
+            _get_exception_fields=mock.MagicMock(return_value=_tvf),
             _get_validation_exceptions=mock.MagicMock(return_value=_tvf),
             _get_after_validation_exceptions=mock.MagicMock(return_value=_rv),
         ):
@@ -967,10 +1159,11 @@ class TierTierValidation(CommonTierValidation):
                 # Flush manually to trigger the _write
                 self.test_record_computed.flush_recordset()
         self.assertEqual(self.test_record_computed.state, "draft")
-        # The validation is performed
+        # The validation is performed -- the single review is auto-promoted
+        # to ``pending`` so the reviewer can act on it.
         self.test_record_computed.request_validation()
         self.test_record_computed.invalidate_recordset()
-        self.assertEqual(self.test_record_computed.review_ids.status, "waiting")
+        self.assertEqual(self.test_record_computed.review_ids.status, "pending")
         self.test_record_computed.with_user(self.test_user_1).validate_tier()
         self.test_record_computed.invalidate_recordset()
         self.assertEqual(self.test_record_computed.review_ids.status, "approved")
@@ -1201,6 +1394,93 @@ class TierTierValidation(CommonTierValidation):
         self.assertIn(
             self.test_user_3_multi_company.partner_id, followers.mapped("partner_id")
         )
+
+    def test_32_test_review_by_res_groups_field(self):
+        """Test using field-based validation with groups"""
+        selected_field = self.env["ir.model.fields"].search(
+            Domain("model", "=", self.test_model._name)
+            & Domain("name", "=", "group_id")
+        )
+        test_record = self.test_model.create(
+            {"test_field": 2.5, "group_id": self.test_group.id}
+        )
+
+        definition = self.env["tier.definition"].create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "field",
+                "reviewer_field_id": selected_field.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+                "approve_sequence": True,
+            }
+        )
+
+        reviews = test_record.request_validation()
+        review = reviews.filtered(lambda r: r.definition_id == definition)
+        self.assertTrue(review)
+        self.assertEqual(review.reviewer_ids, self.test_user_2 | self.test_user_1)
+
+    def test_33_test_review_by_wrong_field_type(self):
+        """Test using field-based validation with groups"""
+        selected_field = self.env["ir.model.fields"].search(
+            Domain("model", "=", self.test_model._name) & Domain("name", "=", "menu_id")
+        )
+        test_record = self.test_model.create(
+            {
+                "test_field": 2.5,
+                "menu_id": self.env["ir.ui.menu"].search(Domain.TRUE, limit=1).id,
+            }
+        )
+        self.assertTrue(test_record.menu_id)
+        self.env["tier.definition"].create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "field",
+                "reviewer_field_id": selected_field.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+                "approve_sequence": True,
+            }
+        )
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Validation reviewer field should be of the appropriate type",
+        ):
+            test_record.request_validation()
+
+    def test_34_test_duplicate_new_user_should_not_have_review_ids(self):
+        """
+        This test ensures that when a user with review_ids is duplicated and
+        the new user does not get the same review_ids.
+        """
+        # Create new test record
+        test_record = self.test_model.create({"test_field": 2.5})
+        # Create tier definitions
+        self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_2.id,
+                "definition_domain": "[('test_field', '>', 1.0)]",
+                "has_comment": True,
+            }
+        )
+
+        # Request validation
+        review = test_record.request_validation()
+        self.assertTrue(review)
+
+        # User Should have review_ids
+        self.assertTrue(self.test_user_2.review_ids.ids)
+        self.assertEqual(
+            self.test_user_2.review_ids.mapped("res_id"),
+            [test_record.id],
+        )
+
+        # Duplicate user
+        new_user = self.test_user_2.copy()
+
+        # Review_ids should not be copied when duplicating a user
+        self.assertFalse(new_user.review_ids.ids)
 
 
 @tagged("at_install")

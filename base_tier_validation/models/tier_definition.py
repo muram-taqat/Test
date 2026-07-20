@@ -1,7 +1,8 @@
 # Copyright 2017 ForgeFlow S.L. (https://www.forgeflow.com)
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
-from odoo import _, api, fields, models
+from odoo import api, fields, models
+from odoo.fields import Domain
 
 
 class TierDefinition(models.Model):
@@ -10,7 +11,7 @@ class TierDefinition(models.Model):
 
     @api.model
     def _get_default_name(self):
-        return _("New Tier Validation")
+        return self.env._("New Tier Validation")
 
     @api.model
     def _get_tier_validation_model_names(self):
@@ -93,11 +94,7 @@ class TierDefinition(models.Model):
         help="If set, reviewers will be notified by email when a reviews related "
         "to this definition are restarted.",
     )
-    has_comment = fields.Boolean(
-        string="Comment",
-        default=False,
-        help="If set, Allow the reviewer to leave a comment on the review.",
-    )
+    has_comment = fields.Boolean(string="Comment", default=False)
     notify_reminder_delay = fields.Integer(
         string="Send reminder message on pending reviews",
         help="Number of days after which a message must be posted to remind about "
@@ -120,11 +117,22 @@ class TierDefinition(models.Model):
 
     @api.depends("review_type", "model_id")
     def _compute_domain_reviewer_field(self):
+        models = self.mapped("model")
+        IrModelFields = self.env["ir.model.fields"].sudo()
+        valid_reviewer_fields = dict(
+            IrModelFields._read_group(
+                domain=Domain("model", "in", models)
+                & (
+                    Domain("relation", "=", "res.users")
+                    | Domain("relation", "=", "res.groups")
+                ),
+                groupby=["model"],
+                aggregates=["id:array_agg"],
+            )
+        )
         for rec in self:
-            rec.valid_reviewer_field_ids = (
-                self.env["ir.model.fields"]
-                .sudo()
-                .search([("model", "=", rec.model), ("relation", "=", "res.users")])
+            rec.valid_reviewer_field_ids = valid_reviewer_fields.get(
+                rec.model, IrModelFields
             )
 
     def _get_review_needing_reminder(self):
@@ -135,22 +143,23 @@ class TierDefinition(models.Model):
         review_date = fields.Datetime.subtract(
             fields.Datetime.now(), days=self.notify_reminder_delay
         )
+        domain = (
+            Domain("definition_id", "=", self.id)
+            & Domain("status", "in", ["waiting", "pending"])
+            & (
+                Domain("create_date", "<", review_date)
+                & Domain("last_reminder_date", "=", False)
+                | Domain("last_reminder_date", "<", review_date)
+            )
+        )
         return self.env["tier.review"].search(
-            [
-                ("definition_id", "=", self.id),
-                ("status", "in", ["waiting", "pending"]),
-                "|",
-                "&",
-                ("create_date", "<", review_date),
-                ("last_reminder_date", "=", False),
-                ("last_reminder_date", "<", review_date),
-            ],
+            domain,
             limit=1,
         )
 
     def _cron_send_review_reminder(self):
         definition_with_reminder = self.env["tier.definition"].search(
-            [("notify_reminder_delay", ">", 0)]
+            Domain("notify_reminder_delay", ">", 0)
         )
         for record in definition_with_reminder:
             review_to_remind = record._get_review_needing_reminder()
